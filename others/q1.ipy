@@ -1,0 +1,673 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+import os
+import warnings
+from scipy import stats
+from sklearn.linear_model import LinearRegression
+from sklearn.metrics import r2_score, mean_squared_error
+
+warnings.filterwarnings('ignore')
+
+# 设置中文字体和样式
+sns.set(style="whitegrid", palette="pastel")
+plt.rcParams['font.sans-serif'] = ['SimHei']  # 支持中文
+plt.rcParams['axes.unicode_minus'] = False
+
+# 创建results目录
+os.makedirs('results', exist_ok=True)
+
+
+class NIPTDataProcessor:
+    """NIPT数据预处理和工具类"""
+
+    def __init__(self):
+        self.male_data = None
+        self.female_data = None
+
+    def load_data(self, file_path):
+        """加载Excel数据"""
+        try:
+            self.male_data = pd.read_excel(file_path, sheet_name='男胎检测数据')
+            self.female_data = pd.read_excel(file_path, sheet_name='女胎检测数据')
+
+            columns = ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M', 'N', 'O', 'P',
+                       'Q', 'R', 'S', 'T', 'U', 'V', 'W', 'X', 'Y', 'Z', 'AA', 'AB', 'AC', 'AD', 'AE']
+
+            self.male_data.columns = columns[:len(self.male_data.columns)]
+            self.female_data.columns = columns[:len(self.female_data.columns)]
+
+            print(f"数据加载完成: 男胎 {len(self.male_data)} 条, 女胎 {len(self.female_data)} 条")
+            return True
+
+        except Exception as e:
+            print(f"数据加载失败: {e}")
+            return False
+
+    def parse_gestational_week(self, week_str):
+        """解析孕周格式"""
+        if pd.isna(week_str) or week_str == '':
+            return np.nan
+
+        try:
+            week_str = str(week_str).strip()
+            if 'w' in week_str:
+                parts = week_str.split('w')
+                weeks = float(parts[0])
+                if len(parts) > 1 and '+' in parts[1]:
+                    days = float(parts[1].replace('+', ''))
+                    return weeks + days / 7.0
+                else:
+                    return weeks
+            else:
+                return float(week_str)
+        except:
+            return np.nan
+
+    def preprocess_male_data(self):
+        """预处理男胎数据"""
+        if self.male_data is None:
+            return None
+
+        df = self.male_data.copy()
+
+        # 转换孕周格式
+        if 'J' in df.columns:
+            df['J_week'] = df['J'].apply(self.parse_gestational_week)
+        else:
+            return None
+
+        # 质量控制过滤
+        original_len = len(df)
+
+        # 检查必要列
+        required_cols = ['V', 'K', 'P', 'L', 'AA']
+        missing_cols = [col for col in required_cols if col not in df.columns]
+        if missing_cols:
+            print(f"缺少必要列: {missing_cols}")
+            return None
+
+        # 应用过滤条件
+        filters = [
+            (df['P'] >= 0.35) & (df['P'] <= 0.65) & df['P'].notna(),
+            (df['L'] >= 1000000) & df['L'].notna(),
+            (df['AA'] <= 0.5) & (df['AA'] >= 0) & df['AA'].notna(),
+            (df['V'] >= 0) & (df['V'] <= 1) & df['V'].notna(),
+            (df['K'] >= 15) & (df['K'] <= 50) & df['K'].notna(),
+            (df['J_week'] >= 8) & (df['J_week'] <= 30) & df['J_week'].notna()
+        ]
+
+        for f in filters:
+            df = df[f]
+
+        df = df.dropna(subset=['V', 'K', 'J_week'])
+
+        print(f"数据预处理完成: {original_len} -> {len(df)} 条记录")
+
+        if len(df) == 0:
+            return None
+
+        return df.reset_index(drop=True)
+
+
+class Problem1Solver:
+    """Y染色体浓度与孕周、BMI关系模型"""
+
+    def __init__(self, data_processor):
+        self.data_processor = data_processor
+        self.model = None
+        self.feature_names = None
+        self.feature_means = None
+        self.feature_stds = None
+
+    def safe_log_transform(self, series, base=10):
+        """安全的对数变换"""
+        series = pd.Series(series).copy()
+        series = series[series > 0]
+        if len(series) == 0:
+            return pd.Series([])
+
+        if base == 10:
+            return np.log10(series)
+        else:
+            return np.log(series)
+
+    def prepare_features(self, df):
+        """准备特征变量"""
+        features = pd.DataFrame(index=df.index)
+
+        # 基础特征
+        features['J_week'] = df['J_week'].astype(float)
+        features['K_BMI'] = df['K'].astype(float)
+
+        # 可选特征
+        if 'C' in df.columns:
+            features['C_age'] = df['C'].astype(float)
+        else:
+            features['C_age'] = 30.0
+
+        # 质量控制变量
+        if 'L' in df.columns and len(df['L'][df['L'] > 0]) > 0:
+            log_reads = self.safe_log_transform(df['L'])
+            if len(log_reads) > 0:
+                features['L_reads'] = log_reads
+            else:
+                features['L_reads'] = 6.0
+        else:
+            features['L_reads'] = 6.0
+
+        # 其他质量控制参数
+        optional_features = {
+            'M': ('M_mapped', 0.8),
+            'N': ('N_dup', 0.03),
+            'P': ('P_GC', 0.45),
+            'AA': ('AA_filtered', 0.05)
+        }
+
+        for col, (feat_name, default_val) in optional_features.items():
+            if col in df.columns:
+                features[feat_name] = df[col].fillna(default_val).astype(float)
+            else:
+                features[feat_name] = default_val
+
+        # 交互项和非线性项
+        try:
+            features['J_K_interact'] = features['J_week'] * features['K_BMI']
+            features['J_week_sq'] = features['J_week'] ** 2
+            features['K_BMI_sq'] = features['K_BMI'] ** 2
+        except Exception as e:
+            print(f"创建交互项失败: {e}")
+
+        # 处理异常值
+        for col in features.columns:
+            features[col] = features[col].replace([np.inf, -np.inf], np.nan)
+            if features[col].isna().any():
+                median_val = features[col].median()
+                if pd.isna(median_val):
+                    features[col] = features[col].fillna(0)
+                else:
+                    features[col] = features[col].fillna(median_val)
+
+        return features
+
+    def fit_model(self, df):
+        """拟合关系模型"""
+        try:
+            features = self.prepare_features(df)
+            target = df['V'].values.astype(float)
+
+            # 确保数据一致性
+            if len(features) != len(target):
+                min_len = min(len(features), len(target))
+                features = features.iloc[:min_len]
+                target = target[:min_len]
+
+            target = pd.Series(target).replace([np.inf, -np.inf], np.nan).fillna(target.mean())
+
+            self.feature_names = features.columns.tolist()
+            features_array = features.values
+
+            # 处理异常值
+            if np.isnan(features_array).any() or np.isinf(features_array).any():
+                features_array = np.nan_to_num(features_array, nan=0.0, posinf=1e6, neginf=-1e6)
+
+            # 手动标准化
+            feature_means = np.mean(features_array, axis=0)
+            feature_stds = np.std(features_array, axis=0)
+            feature_stds[feature_stds == 0] = 1.0
+
+            X_scaled = (features_array - feature_means) / feature_stds
+
+            if np.isnan(X_scaled).any() or np.isinf(X_scaled).any():
+                X_scaled = np.nan_to_num(X_scaled, nan=0.0, posinf=5.0, neginf=-5.0)
+
+            self.feature_means = feature_means
+            self.feature_stds = feature_stds
+
+            # 使用numpy最小二乘法
+            X_with_intercept = np.column_stack([np.ones(len(X_scaled)), X_scaled])
+
+            try:
+                coefficients, residuals, rank, s = np.linalg.lstsq(X_with_intercept, target, rcond=None)
+
+                class SimpleLinearModel:
+                    def __init__(self, coef, intercept):
+                        self.coef_ = coef[1:]
+                        self.intercept_ = coef[0]
+
+                    def predict(self, X):
+                        return X @ self.coef_ + self.intercept_
+
+                self.model = SimpleLinearModel(coefficients, coefficients[0])
+
+            except np.linalg.LinAlgError as e:
+                from sklearn.linear_model import Ridge
+                ridge_model = Ridge(alpha=1.0)
+                ridge_model.fit(X_scaled, target)
+                self.model = ridge_model
+
+            # 计算模型性能
+            if hasattr(self.model, 'predict'):
+                y_pred = self.model.predict(X_scaled)
+            else:
+                y_pred = X_scaled @ self.model.coef_ + self.model.intercept_
+
+            r2 = r2_score(target, y_pred)
+            rmse = np.sqrt(mean_squared_error(target, y_pred))
+
+            print(f"模型训练完成 - R²: {r2:.4f}, RMSE: {rmse:.4f}")
+
+            return self.model
+
+        except Exception as e:
+            print(f"模型拟合失败: {e}")
+            return None
+
+    def predict(self, df):
+        """预测Y染色体浓度"""
+        if self.model is None:
+            raise ValueError("模型尚未拟合")
+
+        try:
+            features = self.prepare_features(df)
+            features_array = features.values
+
+            if np.isnan(features_array).any() or np.isinf(features_array).any():
+                features_array = np.nan_to_num(features_array, nan=0.0, posinf=1e6, neginf=-1e6)
+
+            X_scaled = (features_array - self.feature_means) / self.feature_stds
+
+            if np.isnan(X_scaled).any() or np.isinf(X_scaled).any():
+                X_scaled = np.nan_to_num(X_scaled, nan=0.0, posinf=5.0, neginf=-5.0)
+
+            if hasattr(self.model, 'predict'):
+                y_pred = self.model.predict(X_scaled)
+            else:
+                y_pred = X_scaled @ self.model.coef_ + self.model.intercept_
+
+            return y_pred
+
+        except Exception as e:
+            print(f"预测失败: {e}")
+            return np.full(len(df), 0.05)
+
+    def analyze_significance(self, df):
+        """分析显著性"""
+        try:
+            coefs = self.model.coef_
+            intercept = self.model.intercept_
+
+            features = self.prepare_features(df)
+            target = df['V']
+
+            correlations = []
+            for col in features.columns:
+                try:
+                    corr, p_value = stats.pearsonr(features[col], target)
+                    if np.isnan(corr):
+                        corr = 0.0
+                    if np.isnan(p_value):
+                        p_value = 1.0
+                    correlations.append({
+                        'variable': col,
+                        'correlation': corr,
+                        'p_value': p_value,
+                        'significant': p_value < 0.05
+                    })
+                except Exception:
+                    correlations.append({
+                        'variable': col,
+                        'correlation': 0.0,
+                        'p_value': 1.0,
+                        'significant': False
+                    })
+
+            corr_df = pd.DataFrame(correlations).sort_values('correlation', key=abs, ascending=False)
+            return corr_df
+
+        except Exception as e:
+            print(f"显著性分析失败: {e}")
+            return pd.DataFrame()
+
+    def generate_prediction_grid(self, J_range=(10, 25), K_range=(20, 45), n_points=50):
+        """生成预测网格"""
+        try:
+            J_grid = np.linspace(J_range[0], J_range[1], n_points)
+            K_grid = np.linspace(K_range[0], K_range[1], n_points)
+
+            J_mesh, K_mesh = np.meshgrid(J_grid, K_grid)
+
+            grid_df = pd.DataFrame({
+                'J_week': J_mesh.ravel(),
+                'K': K_mesh.ravel(),
+                'C': 30,
+                'L': 3000000,
+                'M': 0.8, 'N': 0.03, 'P': 0.45, 'AA': 0.05
+            })
+
+            pred_V = self.predict(grid_df)
+
+            result_df = pd.DataFrame({
+                'J_week': J_mesh.ravel(),
+                'K_BMI': K_mesh.ravel(),
+                'pred_V': pred_V
+            })
+
+            return result_df
+
+        except Exception as e:
+            print(f"生成预测网格失败: {e}")
+            return pd.DataFrame()
+
+    def plot_results(self, df):
+        """创新的可视化方案"""
+        try:
+            fig = plt.figure(figsize=(20, 15))
+            gs = fig.add_gridspec(3, 4, hspace=0.3, wspace=0.3)
+
+            y_pred = self.predict(df)
+            y_true = df['V'].values
+
+            # 1. Y浓度热力图 (孕周 vs BMI)
+            ax1 = fig.add_subplot(gs[0, :2])
+
+            # 创建网格数据用于热力图
+            J_bins = pd.cut(df['J_week'], bins=15, labels=False)
+            K_bins = pd.cut(df['K'], bins=15, labels=False)
+
+            # 计算每个格子的平均Y浓度
+            heatmap_data = df.groupby([J_bins, K_bins])['V'].mean().unstack(fill_value=0)
+
+            im1 = ax1.imshow(heatmap_data.values, cmap='viridis', aspect='auto', origin='lower')
+            ax1.set_title('Y染色体浓度热力图\n(孕周 × BMI)', fontsize=14, fontweight='bold')
+            ax1.set_xlabel('BMI 分组')
+            ax1.set_ylabel('孕周 分组')
+            plt.colorbar(im1, ax=ax1, fraction=0.046)
+
+            # 2. 小提琴图：不同孕周组的Y浓度分布
+            ax2 = fig.add_subplot(gs[0, 2])
+
+            # 将孕周分组
+            df_copy = df.copy()
+            df_copy['week_group'] = pd.cut(df_copy['J_week'],
+                                           bins=[8, 12, 16, 20, 24, 30],
+                                           labels=['8-12w', '12-16w', '16-20w', '20-24w', '24-30w'])
+
+            # 过滤掉空组
+            valid_groups = df_copy.dropna(subset=['week_group'])
+            if len(valid_groups) > 0:
+                parts = ax2.violinplot([valid_groups[valid_groups['week_group'] == group]['V'].values
+                                        for group in valid_groups['week_group'].cat.categories
+                                        if len(valid_groups[valid_groups['week_group'] == group]) > 0],
+                                       showmeans=True, showmedians=True)
+
+                for i, pc in enumerate(parts['bodies']):
+                    pc.set_facecolor(plt.cm.Set3(i))
+                    pc.set_alpha(0.7)
+
+                ax2.set_xticks(range(1, len([g for g in valid_groups['week_group'].cat.categories
+                                             if len(valid_groups[valid_groups['week_group'] == g]) > 0]) + 1))
+                ax2.set_xticklabels([g for g in valid_groups['week_group'].cat.categories
+                                     if len(valid_groups[valid_groups['week_group'] == g]) > 0], rotation=45)
+
+            ax2.set_title('Y浓度分布\n(按孕周分组)', fontsize=12, fontweight='bold')
+            ax2.set_ylabel('Y浓度')
+
+            # 3. 箱线图：不同BMI组的Y浓度分布
+            ax3 = fig.add_subplot(gs[0, 3])
+
+            df_copy['bmi_group'] = pd.cut(df_copy['K'],
+                                          bins=[15, 20, 25, 30, 35, 50],
+                                          labels=['<20', '20-25', '25-30', '30-35', '>35'])
+
+            valid_bmi_groups = df_copy.dropna(subset=['bmi_group'])
+            if len(valid_bmi_groups) > 0:
+                box_data = [valid_bmi_groups[valid_bmi_groups['bmi_group'] == group]['V'].values
+                            for group in valid_bmi_groups['bmi_group'].cat.categories
+                            if len(valid_bmi_groups[valid_bmi_groups['bmi_group'] == group]) > 0]
+
+                bp = ax3.boxplot(box_data, patch_artist=True)
+                colors = plt.cm.Set2(np.linspace(0, 1, len(bp['boxes'])))
+                for patch, color in zip(bp['boxes'], colors):
+                    patch.set_facecolor(color)
+                    patch.set_alpha(0.7)
+
+                ax3.set_xticks(range(1, len([g for g in valid_bmi_groups['bmi_group'].cat.categories
+                                             if len(valid_bmi_groups[valid_bmi_groups['bmi_group'] == g]) > 0]) + 1))
+                ax3.set_xticklabels([g for g in valid_bmi_groups['bmi_group'].cat.categories
+                                     if len(valid_bmi_groups[valid_bmi_groups['bmi_group'] == g]) > 0])
+
+            ax3.set_title('Y浓度分布\n(按BMI分组)', fontsize=12, fontweight='bold')
+            ax3.set_ylabel('Y浓度')
+
+            # 4. 相关性矩阵热力图
+            ax4 = fig.add_subplot(gs[1, :2])
+
+            features = self.prepare_features(df)
+            corr_cols = ['J_week', 'K_BMI', 'C_age', 'L_reads', 'P_GC']
+            available_cols = [col for col in corr_cols if col in features.columns]
+
+            if len(available_cols) > 1:
+                corr_data = features[available_cols].copy()
+                corr_data['Y_concentration'] = df['V']
+                corr_matrix = corr_data.corr()
+
+                mask = np.triu(np.ones_like(corr_matrix, dtype=bool))
+                sns.heatmap(corr_matrix, mask=mask, annot=True, cmap='RdBu_r', center=0,
+                            square=True, linewidths=0.5, ax=ax4, fmt='.3f')
+
+            ax4.set_title('特征相关性矩阵', fontsize=14, fontweight='bold')
+
+            # 5. 回归拟合曲线 (3D投影到2D)
+            ax5 = fig.add_subplot(gs[1, 2:])
+
+            # 创建散点图，颜色表示预测值
+            scatter = ax5.scatter(df['J_week'], df['K'], c=y_pred,
+                                  cmap='plasma', alpha=0.6, s=50)
+
+            # 添加等值线
+            try:
+                grid_df = self.generate_prediction_grid()
+                if not grid_df.empty:
+                    # 重塑为网格
+                    J_unique = np.sort(grid_df['J_week'].unique())
+                    K_unique = np.sort(grid_df['K_BMI'].unique())
+
+                    if len(J_unique) > 1 and len(K_unique) > 1:
+                        J_grid = grid_df['J_week'].values.reshape(len(K_unique), len(J_unique))
+                        K_grid = grid_df['K_BMI'].values.reshape(len(K_unique), len(J_unique))
+                        V_grid = grid_df['pred_V'].values.reshape(len(K_unique), len(J_unique))
+
+                        contour = ax5.contour(J_grid, K_grid, V_grid, levels=10, colors='white', alpha=0.8,
+                                              linewidths=1)
+                        ax5.clabel(contour, inline=True, fontsize=8, fmt='%.3f')
+            except Exception:
+                pass
+
+            ax5.set_xlabel('孕周')
+            ax5.set_ylabel('BMI')
+            ax5.set_title('Y浓度预测等值线图', fontsize=14, fontweight='bold')
+            plt.colorbar(scatter, ax=ax5, fraction=0.046, label='预测Y浓度')
+
+            # 6. 残差分析与分布
+            ax6 = fig.add_subplot(gs[2, 0])
+            residuals = y_true - y_pred
+            ax6.hist(residuals, bins=30, alpha=0.7, color='skyblue', edgecolor='black')
+            ax6.axvline(x=0, color='red', linestyle='--', linewidth=2)
+            ax6.set_xlabel('残差')
+            ax6.set_ylabel('频数')
+            ax6.set_title('残差分布直方图', fontsize=12, fontweight='bold')
+
+            # 7. Q-Q图检验残差正态性
+            ax7 = fig.add_subplot(gs[2, 1])
+            stats.probplot(residuals, dist="norm", plot=ax7)
+            ax7.set_title('残差Q-Q图', fontsize=12, fontweight='bold')
+            ax7.grid(True, alpha=0.3)
+
+            # 8. 达标率趋势分析
+            ax8 = fig.add_subplot(gs[2, 2])
+
+            # 按孕周计算达标率
+            week_bins = pd.cut(df['J_week'], bins=10)
+            compliance_rate = df.groupby(week_bins)['V'].apply(lambda x: (x >= 0.04).mean())
+            sample_counts = df.groupby(week_bins).size()
+
+            week_centers = [interval.mid for interval in compliance_rate.index if pd.notna(interval.left)]
+            valid_rates = [rate for rate, interval in zip(compliance_rate.values, compliance_rate.index)
+                           if not pd.isna(rate) and pd.notna(interval.left)]
+            valid_counts = [count for count, interval in zip(sample_counts.values, sample_counts.index)
+                            if pd.notna(interval.left)]
+
+            if len(week_centers) > 0:
+                # 主线：达标率
+                line1 = ax8.plot(week_centers, valid_rates, 'o-', color='blue', linewidth=2, label='达标率')
+                ax8.axhline(y=0.9, color='red', linestyle='--', alpha=0.7, label='90%目标线')
+
+                # 添加样本量信息（右轴）
+                ax8_twin = ax8.twinx()
+                bars = ax8_twin.bar(week_centers, valid_counts, alpha=0.3, color='gray',
+                                    width=0.5, label='样本量')
+
+                ax8.set_xlabel('孕周')
+                ax8.set_ylabel('达标率', color='blue')
+                ax8_twin.set_ylabel('样本量', color='gray')
+                ax8.set_ylim(0, 1)
+
+                # 合并图例
+                lines1, labels1 = ax8.get_legend_handles_labels()
+                lines2, labels2 = ax8_twin.get_legend_handles_labels()
+                ax8.legend(lines1 + lines2, labels1 + labels2, loc='upper left')
+
+            ax8.set_title('达标率趋势分析', fontsize=12, fontweight='bold')
+            ax8.grid(True, alpha=0.3)
+
+            # 9. 特征重要性雷达图
+            ax9 = fig.add_subplot(gs[2, 3], projection='polar')
+
+            try:
+                importance = np.abs(self.model.coef_)
+                # 选择最重要的几个特征
+                top_n = min(8, len(importance))
+                sorted_idx = np.argsort(importance)[::-1][:top_n]
+
+                top_importance = importance[sorted_idx]
+                top_names = [self.feature_names[i] for i in sorted_idx]
+
+                # 标准化重要性
+                if len(top_importance) > 0:
+                    top_importance = top_importance / np.max(top_importance)
+
+                    # 创建雷达图
+                    angles = np.linspace(0, 2 * np.pi, len(top_importance), endpoint=False)
+                    top_importance = np.concatenate((top_importance, [top_importance[0]]))  # 闭合
+                    angles = np.concatenate((angles, [angles[0]]))  # 闭合
+
+                    ax9.plot(angles, top_importance, 'o-', linewidth=2, color='red')
+                    ax9.fill(angles, top_importance, alpha=0.25, color='red')
+                    ax9.set_xticks(angles[:-1])
+                    ax9.set_xticklabels(top_names, fontsize=10)
+                    ax9.set_ylim(0, 1)
+                    ax9.grid(True)
+            except Exception:
+                ax9.text(0.5, 0.5, '特征重要性\n计算失败', ha='center', va='center',
+                         transform=ax9.transAxes)
+
+            ax9.set_title('特征重要性雷达图', fontsize=12, fontweight='bold', y=1.08)
+
+            plt.suptitle('NIPT Y染色体浓度关系模型 - 综合分析报告',
+                         fontsize=18, fontweight='bold', y=0.98)
+
+            return fig
+
+        except Exception as e:
+            print(f"可视化失败: {e}")
+            fig, ax = plt.subplots(1, 1, figsize=(8, 6))
+            ax.text(0.5, 0.5, f'可视化失败: {str(e)}', ha='center', va='center', transform=ax.transAxes)
+            return fig
+
+
+def run_problem1():
+    """运行问题1分析"""
+    print("=" * 50)
+    print("NIPT Y染色体浓度关系模型分析")
+    print("=" * 50)
+
+    try:
+        # 数据加载与预处理
+        processor = NIPTDataProcessor()
+        if not processor.load_data('S:/academic_codes/sxjm-2025-school/data.xlsx'):
+            return None
+
+        male_df = processor.preprocess_male_data()
+        if male_df is None or len(male_df) == 0:
+            print("数据预处理失败")
+            return None
+
+        # 模型分析
+        solver = Problem1Solver(processor)
+
+        model = solver.fit_model(male_df)
+        if model is None:
+            return None
+
+        corr_results = solver.analyze_significance(male_df)
+        grid_df = solver.generate_prediction_grid()
+
+        # 生成可视化
+        fig = solver.plot_results(male_df)
+        plt.savefig('results/problem1_analysis.png', dpi=300, bbox_inches='tight',
+                    facecolor='white', edgecolor='none')
+        plt.show()
+
+        # 保存结果
+        coef_df = pd.DataFrame({
+            'parameter': ['intercept'] + solver.feature_names,
+            'coefficient': [solver.model.intercept_] + list(solver.model.coef_)
+        })
+        coef_df.to_csv('results/problem1_coefficients.csv', index=False, encoding='utf-8-sig')
+
+        if not corr_results.empty:
+            corr_results.to_csv('results/problem1_correlations.csv', index=False, encoding='utf-8-sig')
+
+        if not grid_df.empty:
+            grid_df.to_csv('results/problem1_prediction_grid.csv', index=False, encoding='utf-8-sig')
+
+        # 性能指标
+        y_pred = solver.predict(male_df)
+        y_true = male_df['V'].values
+
+        performance_df = pd.DataFrame({
+            'metric': ['R2', 'RMSE', 'MAE', 'Sample_Size'],
+            'value': [
+                r2_score(y_true, y_pred),
+                np.sqrt(mean_squared_error(y_true, y_pred)),
+                np.mean(np.abs(y_true - y_pred)),
+                len(y_true)
+            ]
+        })
+        performance_df.to_csv('results/problem1_performance.csv', index=False, encoding='utf-8-sig')
+
+        # 结果摘要
+        print(f"\n模型性能: R² = {r2_score(y_true, y_pred):.4f}")
+        print(f"样本数量: {len(y_true)}")
+        print(f"达标率(≥4%): {(y_true >= 0.04).mean():.3f}")
+
+        print("\n主要影响因素:")
+        importance = np.abs(solver.model.coef_)
+        sorted_idx = np.argsort(importance)[::-1][:3]
+        for i, idx in enumerate(sorted_idx):
+            print(f"{i + 1}. {solver.feature_names[idx]}: {solver.model.coef_[idx]:.4f}")
+
+        print("\n分析完成！结果已保存到 results/ 目录")
+        print("=" * 50)
+
+        return solver
+
+    except Exception as e:
+        print(f"分析失败: {e}")
+        return None
+
+
+if __name__ == "__main__":
+    run_problem1()
